@@ -74,6 +74,12 @@ create({
   index: 'index.html', // optional index document, default: index.html
   error: '404.html', // optional error document, default: none
   exclude: ['.git/*', '.gitignore'], // optional path patterns to be excluded from being created/updated/removed, default: [], `*` is the wildcard
+  cacheControl: { // optional: one Cache-Control string for every file, or { glob: value }, first match wins (`**` spans directories)
+    'static/**': 'public, max-age=31536000, immutable',
+    '**': 'no-cache'
+  },
+  keep: ['static/**'], // optional globs of remote files that deploy never deletes (e.g. hashed chunks still used by open tabs), default: []
+  uploadLast: ['index.html'], // optional globs uploaded after every other file, default: [index]; deletions run after both
   routes: [{
     Condition: {
         KeyPrefixEquals: 'foo/'

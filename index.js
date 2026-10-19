@@ -178,6 +178,28 @@ function getExtension (file) {
   return spl.length > 0 && spl[spl.length - 1]
 }
 
+// Glob match on a relative key: `**` spans directories, `*` stays within one.
+function matchesGlob (pattern, file) {
+  var source = pattern.split('**').map(function (part) {
+    return part.split('*').map(function (s) {
+      return s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    }).join('[^/]*')
+  }).join('.*')
+  return new RegExp('^' + source + '$').test(file)
+}
+
+function matchesAny (patterns, file) {
+  return (patterns || []).some(function (pattern) { return matchesGlob(pattern, file) })
+}
+
+// cacheControl is either one value for every file, or { pattern: value } where the first matching pattern wins.
+function getCacheControl (config, file) {
+  var cacheControl = config.cacheControl
+  if (cacheControl == null || typeof cacheControl === 'string') return cacheControl != null ? cacheControl : null
+  var pattern = Object.keys(cacheControl).find(function (p) { return matchesGlob(p, file) })
+  return pattern ? cacheControl[pattern] : null
+}
+
 function uploadFile (s3, config, file, cb) {
   const ext = getExtension(file)
   const contentType = config.contentTypes && config.contentTypes[ext]
@@ -187,7 +209,7 @@ function uploadFile (s3, config, file, cb) {
     Key: normalizeKey(config.prefix, file),
     Body: fs.createReadStream(path.join(config.uploadDir, file)),
     ContentType: contentType || mime.lookup(file),
-    CacheControl: (config.cacheControl != null) ? config.cacheControl : null
+    CacheControl: getCacheControl(config, file)
   }
 
   logUpdate('Uploading: ' + file)
@@ -561,46 +583,42 @@ function putWebsiteContent (s3, config, cb) {
       logResults(err, results)
     }
 
-    // Delete files that exist on s3, but not locally
-    chunkedAction(
-       s3,
-       config,
-       deleteFiles,
-       data.missing,
-       function (err, eTags, result) {
-         if (err) { console.error(err) }
-         results.removed = results.removed.concat(result.done)
-         results.errors = results.errors.concat(result.errors)
-         checkDone(data, results, handleRetry)
-       })
+    // Never delete remote files matching `keep`, e.g. the previous release's hashed chunks that open tabs still load.
+    data.missing = data.missing.filter(function (file) { return !matchesAny(config.keep, file) })
 
-    // Upload changed files
-    chunkedAction(
-       s3,
-       config,
-       uploadFiles,
-       data.changed,
-       function (err, eTags, result) {
-         if (err) { console.error(err) }
-         results.updated = results.updated.concat(result.done)
-         results.errors = results.errors.concat(result.errors)
-         checkDone(data, results, handleRetry)
-       })
+    function runPhase (action, files) {
+      return new Promise(function (resolve) {
+        if (files.length === 0) return resolve({ done: [], errors: [] })
+        chunkedAction(s3, config, action, files, function (err, eTags, result) {
+          if (err) { console.error(err) }
+          resolve(result)
+        })
+      })
+    }
 
-     // Upload files that exist locally but not on s3
-    chunkedAction(
-       s3,
-       config,
-       uploadFiles,
-       data.extra,
-       function (err, eTags, result) {
-         if (err) { console.error(err) }
-         results.uploaded = results.uploaded.concat(result.done)
-         results.errors = results.errors.concat(result.errors)
-         checkDone(data, results, handleRetry)
-       })
+    // Ordered so a browser never sees an entry point before the assets it references, or loses an asset it still needs:
+    // 1. upload everything except `uploadLast`, 2. upload `uploadLast` (default: the index document), 3. delete.
+    var uploadLast = config.uploadLast || [config.index]
+    var toUpload = data.changed.concat(data.extra)
+    var first = toUpload.filter(function (file) { return !matchesAny(uploadLast, file) })
+    var last = toUpload.filter(function (file) { return matchesAny(uploadLast, file) })
 
-    checkDone(data, results, handleRetry)
+    runPhase(uploadFiles, first)
+      .then(function (firstResult) {
+        return runPhase(uploadFiles, last).then(function (lastResult) {
+          var done = firstResult.done.concat(lastResult.done)
+          results.updated = done.filter(function (file) { return data.changed.indexOf(file) >= 0 })
+          results.uploaded = done.filter(function (file) { return data.extra.indexOf(file) >= 0 })
+          results.errors = firstResult.errors.concat(lastResult.errors)
+          return runPhase(deleteFiles, data.missing)
+        })
+      })
+      .then(function (deleteResult) {
+        results.removed = deleteResult.done
+        results.errors = results.errors.concat(deleteResult.errors)
+        handleRetry(null, results)
+      })
+      .catch(cb)
   })
 }
 
